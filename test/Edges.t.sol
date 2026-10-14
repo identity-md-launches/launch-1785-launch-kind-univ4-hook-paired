@@ -387,9 +387,119 @@ contract TreasuryEdgeTest is Fixture {
         vm.prank(Protocol.KEEPER);
         treasury.commission(2, bytes("{\"idea\":\"again\"}"));
         asset.mint(address(treasury), 100 ether);
+        // A recorded (factory, number) is no longer eligible, so there is nothing to record.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommission(2, 75, "job-2");
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(2, Protocol.LAUNCH_FACTORY, 75, "job-2");
+        (address factory, uint64 number) = treasury.launchOf(1);
+        assertEq(factory, Protocol.LAUNCH_FACTORY);
+        assertEq(number, 75);
+        (factory, number) = treasury.launchOf(2);
+        assertEq(factory, address(0));
+        assertEq(number, 0);
+        assertEq(treasury.launchToken(Protocol.LAUNCH_FACTORY, 75), address(asset));
+        assertEq(treasury.launchToken(Protocol.PROJECT_FACTORY, 75), address(0));
+    }
+
+    function test_recordCommissionAtGates() public {
+        _twoWinners();
+        MockToken asset = new MockToken();
+        PoolKey memory k =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(asset)), 12_500, 60, IHooks(address(0)));
+        projectFactory.register(81, k, address(treasury));
+        asset.mint(address(this), 950 ether);
+        asset.mint(address(treasury), 50 ether);
+        (address factory, uint64 number) = treasury.launchOf(1);
+        assertEq(factory, address(0));
+        assertEq(number, 0);
+        // Before commission.
         vm.prank(Protocol.KEEPER);
         vm.expectRevert(MediciTreasury.WrongState.selector);
-        treasury.recordCommission(2, 75, "job-2");
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "job");
+        _commission();
+        // Wrong caller.
+        vm.expectRevert(MediciTreasury.Unauthorized.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "job");
+        // A factory that is neither of the two is refused before the epoch is even looked at.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(2, alice, 81, "job");
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(1, address(0), 81, "job");
+        // Epoch zero and an unsettled epoch.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.WrongState.selector);
+        treasury.recordCommissionAt(0, Protocol.PROJECT_FACTORY, 81, "job");
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.WrongState.selector);
+        treasury.recordCommissionAt(2, Protocol.PROJECT_FACTORY, 81, "job");
+        // Empty job id.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "");
+        // The position lives on the other factory.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(1, Protocol.LAUNCH_FACTORY, 81, "job");
+        // The named factory holds the number but the treasury is not its requester.
+        projectFactory.register(82, k, alice);
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 82, "job");
+        // Past the launch deadline nothing can be recorded, even with the factory named.
+        (,,,,, uint64 deadline,) = treasury.epochResult(1);
+        uint256 now_ = vm.getBlockTimestamp();
+        vm.warp(deadline);
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.WrongState.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "job");
+        vm.warp(now_);
+        uint256 aliceBefore = alice.balance;
+        vm.prank(Protocol.KEEPER);
+        vm.expectEmit(true, true, true, true, address(treasury));
+        emit MediciTreasury.Recorded(1, Protocol.PROJECT_FACTORY, 81, "job");
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "job");
+        (uint8 status,,, uint256 bounty, uint64 recorded,,) = treasury.epochResult(1);
+        assertEq(status, 2);
+        assertEq(bounty, 0);
+        assertEq(recorded, 81);
+        assertEq(alice.balance - aliceBefore, 0.016 ether);
+        (factory, number) = treasury.launchOf(1);
+        assertEq(factory, Protocol.PROJECT_FACTORY);
+        assertEq(number, 81);
+        assertEq(treasury.launchToken(Protocol.PROJECT_FACTORY, 81), address(asset));
+        assertEq(treasury.reservedToken(address(asset)), 50 ether);
+        // The same call twice: the epoch is already launched.
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.WrongState.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 81, "job");
+    }
+
+    function test_harvestOfANumberTouchesOnlyRecordedPositions() public {
+        _twoWinners();
+        _commission();
+        MockToken asset = new MockToken();
+        _record(83, asset, false);
+        // A second, unrelated position with the same number on the other factory is not recorded,
+        // so harvest(83) touches only the recorded one.
+        MockToken other = new MockToken();
+        PoolKey memory k =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(other)), 12_500, 60, IHooks(address(0)));
+        projectFactory.register(83, k, address(treasury));
+        other.mint(address(projectFactory), 5 ether);
+        projectFactory.seed(83, 0, 5 ether);
+        asset.mint(address(launchFactory), 2 ether);
+        launchFactory.seed(83, 0, 2 ether);
+        treasury.harvest(83);
+        assertEq(launchFactory.claims(), 1);
+        assertEq(projectFactory.claims(), 0);
+        assertEq(asset.balanceOf(Protocol.DEAD), 2 ether);
+        assertEq(other.balanceOf(Protocol.DEAD), 0);
+        assertEq(other.balanceOf(address(projectFactory)), 5 ether);
     }
 
     function test_positionWithInvertedRangeIsNotALaunch() public {
@@ -429,12 +539,39 @@ contract TreasuryEdgeTest is Fixture {
         treasury.burnUnclaimed(1);
     }
 
-    function test_claimBountyRequiresRecordedLaunch() public {
-        _twoWinners();
+    function test_rejectedBountyIsNotRetriedAndTheWinnerStillBacks() public {
+        // A proposer that cannot take ETH loses the bounty for good: the ETH is free again, the
+        // launch stays recorded, and no later call pays it out.
+        RejectingReceiver proposer = new RejectingReceiver();
+        token.transfer(address(proposer), 5_000_000 ether);
+        vm.prank(address(proposer));
+        token.approve(address(treasury), type(uint256).max);
+        vm.warp(OPEN + 1 days);
+        vm.prank(address(proposer));
+        uint256 id = treasury.propose("Contract proposer", bytes("{\"idea\":\"one\"}"));
+        _vote(address(proposer), 1, id, 3_000_000 ether);
+        _donate(10 ether);
+        vm.warp(treasury.epochEnd(1));
+        treasury.settle(1);
+        (,,, uint256 bounty,,,) = treasury.epochResult(1);
+        assertEq(bounty, 0.016 ether);
+        _commission();
+        MockToken asset = new MockToken();
+        _record(84, asset, false);
+        (uint8 status,,, uint256 left,,,) = treasury.epochResult(1);
+        assertEq(status, 2);
+        assertEq(left, 0);
+        assertEq(address(proposer).balance, 0);
+        assertEq(treasury.escrowed(), 0);
+        assertEq(treasury.freeETH(), 6 ether);
+        // Nothing reopens the payout: a repeated record is refused and the escrow stays released.
+        vm.prank(Protocol.KEEPER);
         vm.expectRevert(MediciTreasury.WrongState.selector);
-        treasury.claimBounty(1);
-        vm.expectRevert(MediciTreasury.WrongState.selector);
-        treasury.claimBounty(2);
+        treasury.recordCommission(1, 84, "job-1");
+        assertEq(treasury.claimable(1, address(proposer)), 50 ether);
+        vm.prank(address(proposer));
+        treasury.claimBacker(1);
+        assertEq(asset.balanceOf(address(proposer)), 50 ether);
     }
 
     function test_keeperWithdrawZeroAboveFreeAndRejectingKeeper() public {
@@ -615,14 +752,27 @@ contract HookEdgeTest is Fixture {
         assertEq(hook.twap(OPEN, OPEN + 1 days), 1e10);
     }
 
-    function test_priceRevertsAtTheExactOpeningSecondOnly() public {
-        vm.expectRevert(MediciHook.NotOpen.selector);
-        hook.price();
-        vm.expectRevert(MediciHook.NotOpen.selector);
-        treasury.proposeCost();
-        vm.warp(OPEN + 1);
+    function test_openingSecondPriceIsTheSpotAndCanBeMovedWithinThatSecond() public {
+        // In the opening second there is no elapsed window: price() is the spot, so governance
+        // works from the first block, but a swap in that same second moves it at once.
+        assertEq(block.timestamp, OPEN);
         assertEq(hook.price(), 1e10);
         assertEq(treasury.proposeCost(), 200_000 ether);
+        vm.prank(alice);
+        uint256 id = treasury.propose("first block", bytes("{}"));
+        assertEq(id, 1);
+        assertEq(treasury.totalBurned(), 200_000 ether);
+        actor.swap(key, true, -int256(0.5 ether), TickMath.MIN_SQRT_PRICE + 1);
+        (, uint192 spot,) = hook.observations(0);
+        assertGt(spot, 1e10);
+        assertEq(hook.price(), spot);
+        assertLt(treasury.proposeCost(), 230_000 ether);
+        // One second later the average over the elapsed second is that final spot.
+        vm.warp(OPEN + 1);
+        assertEq(hook.price(), spot);
+        assertEq(hook.twap(OPEN, OPEN + 1), spot);
+        vm.expectRevert(MediciHook.NotOpen.selector);
+        hook.twap(OPEN, OPEN);
     }
 
     function test_swapOnAnotherPoolWithThisHookIsRefused() public {
@@ -691,22 +841,41 @@ contract HookEdgeTest is Fixture {
         router.harvest();
     }
 
-    function test_routerHarvestWithNothingOwedEmitsZeroAndRejectingTeamBlocksOnlyETH() public {
+    function test_routerHarvestWithNothingOwedAndDeferredTeamPaymentsAccumulate() public {
         launchFactory.register(51, key, address(router));
         router.setLaunchNumber(51);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit MediciFeeRouter.Harvested(51, 0, 0);
         router.harvest();
         assertEq(launchFactory.claims(), 1);
+        // Nothing to pay is not a failure.
+        router.payTeam();
         RejectingReceiver rejecting = new RejectingReceiver();
         vm.prank(Protocol.TEAM);
         treasury.setTeam(address(rejecting));
         vm.deal(address(launchFactory), 1 ether);
         launchFactory.seed(51, 0.1 ether, 0);
-        vm.expectRevert(MediciFeeRouter.TransferFailed.selector);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit MediciFeeRouter.TeamPaymentDeferred(address(rejecting), 0.1 ether);
         router.harvest();
-        // Hand the role back to an account that accepts ETH and the same harvest succeeds.
+        assertEq(address(router).balance, 0.1 ether);
+        // A second harvest while TEAM still rejects retries the whole deferred balance, not just the new fees.
+        launchFactory.seed(51, 0.2 ether, 0);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit MediciFeeRouter.TeamPaymentDeferred(address(rejecting), 0.3 ether);
+        router.harvest();
+        assertEq(address(router).balance, 0.3 ether);
+        vm.expectRevert(MediciFeeRouter.TransferFailed.selector);
+        router.payTeam();
+        assertEq(address(router).balance, 0.3 ether);
+        // Hand the role to an account that accepts ETH: the next harvest flushes everything deferred.
         vm.prank(address(rejecting));
         treasury.setTeam(bob);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit MediciFeeRouter.TeamPaid(bob, 0.3 ether);
         router.harvest();
-        assertEq(bob.balance, 0.1 ether);
+        assertEq(bob.balance, 0.3 ether);
+        assertEq(address(router).balance, 0);
+        assertEq(address(rejecting).balance, 0);
     }
 }

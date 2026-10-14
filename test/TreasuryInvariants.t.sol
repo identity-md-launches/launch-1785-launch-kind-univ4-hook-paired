@@ -22,6 +22,7 @@ contract TreasuryHandler is Test {
     PoolActor public immutable actor;
     MockIntake public immutable intake;
     MockFactory public immutable factory;
+    MockFactory public immutable projectFactory;
     PoolKey internal key;
 
     address[3] public actors;
@@ -36,7 +37,9 @@ contract TreasuryHandler is Test {
     mapping(uint256 => uint8) public finalStatus;
     mapping(uint256 => uint64) public finalLaunch;
     mapping(uint256 => address) public assetOf;
+    mapping(uint256 => address) public factoryOf;
     mapping(uint256 => bool) public swept;
+    uint256 public ambiguousRefusals;
     address[] public assets;
     uint256[] public recordedEpochs;
 
@@ -47,6 +50,7 @@ contract TreasuryHandler is Test {
         PoolActor actor_,
         MockIntake intake_,
         MockFactory factory_,
+        MockFactory projectFactory_,
         PoolKey memory key_,
         address[3] memory actors_
     ) {
@@ -56,6 +60,7 @@ contract TreasuryHandler is Test {
         actor = actor_;
         intake = intake_;
         factory = factory_;
+        projectFactory = projectFactory_;
         key = key_;
         actors = actors_;
     }
@@ -195,7 +200,19 @@ contract TreasuryHandler is Test {
         _snapshotFinal(e);
     }
 
-    function record(uint8 seed, uint8 extraSeed) external {
+    function _eligible(MockFactory f, uint64 n, uint8 extraSeed) internal returns (MockToken asset) {
+        asset = new MockToken();
+        PoolKey memory k =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(asset)), 12_500, 60, IHooks(address(0)));
+        f.register(n, k, address(treasury));
+        asset.mint(address(this), 950 ether);
+        asset.mint(address(treasury), 50 ether + bound(extraSeed, 0, 50) * 1 ether);
+    }
+
+    /// @dev Records the winner's launch on the launch factory, or, when `mirror` is set, on both
+    /// factories under one number: the bare call must then refuse as ambiguous and the explicit
+    /// one must record the project factory's position.
+    function record(uint8 seed, uint8 extraSeed, bool mirror) external {
         if (maxEpochTouched == 0) return;
         uint256 e = bound(seed, 1, maxEpochTouched);
         (uint8 s,,,,, uint64 deadline,) = treasury.epochResult(e);
@@ -204,21 +221,37 @@ contract TreasuryHandler is Test {
         // A commission must have happened for this candidate; the live id or a stored result shows it.
         (bytes32 last,,) = treasury.resultOf(e);
         if (live == 0 && last == 0) return;
-        MockToken asset = new MockToken();
         uint64 n = nextLaunch++;
-        PoolKey memory k =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(asset)), 12_500, 60, IHooks(address(0)));
-        factory.register(n, k, address(treasury));
-        asset.mint(address(this), 950 ether);
-        asset.mint(address(treasury), 50 ether + bound(extraSeed, 0, 50) * 1 ether);
+        MockToken asset = _eligible(factory, n, extraSeed);
+        address recordedOn = address(factory);
+        if (mirror) {
+            asset = _eligible(projectFactory, n, extraSeed);
+            recordedOn = address(projectFactory);
+        }
         (, uint256 winner,, uint256 bounty,,,) = treasury.epochResult(e);
         (address proposer,,,,,) = treasury.proposalOf(e, winner);
         uint256 before = proposer.balance;
-        vm.prank(Protocol.KEEPER);
-        treasury.recordCommission(e, n, "job");
+        if (mirror) {
+            vm.prank(Protocol.KEEPER);
+            try treasury.recordCommission(e, n, "job") {
+                assertTrue(false, "a number eligible on both factories was recorded without naming one");
+            } catch (bytes memory reason) {
+                assertEq(bytes4(reason), MediciTreasury.AmbiguousLaunch.selector, "wrong refusal");
+                ++ambiguousRefusals;
+            }
+            vm.prank(Protocol.KEEPER);
+            treasury.recordCommissionAt(e, address(projectFactory), n, "job");
+        } else {
+            vm.prank(Protocol.KEEPER);
+            treasury.recordCommission(e, n, "job");
+        }
         ghostBountiesPaid += proposer.balance - before;
         assertEq(proposer.balance - before, bounty, "bounty paid in full to the proposer");
+        (address f, uint64 recorded) = treasury.launchOf(e);
+        assertEq(f, recordedOn, "recorded on the wrong factory");
+        assertEq(recorded, n, "recorded the wrong number");
         assetOf[e] = address(asset);
+        factoryOf[e] = recordedOn;
         assets.push(address(asset));
         recordedEpochs.push(e);
         _snapshotFinal(e);
@@ -251,9 +284,15 @@ contract TreasuryHandler is Test {
         uint256 e = recordedEpochs[bound(seed, 0, recordedEpochs.length - 1)];
         (,,,, uint64 n,,) = treasury.epochResult(e);
         uint256 fees = bound(raw, 0, 10 ether);
-        MockToken(assetOf[e]).mint(address(factory), fees);
-        factory.seed(n, 0, fees);
+        MockFactory f = MockFactory(payable(factoryOf[e]));
+        MockToken asset = MockToken(assetOf[e]);
+        asset.mint(address(f), fees);
+        f.seed(n, 0, fees);
+        uint256 deadBefore = asset.balanceOf(Protocol.DEAD);
         treasury.harvest(n);
+        // Everything above the backer reserve is burned; the reserve itself is untouched.
+        assertEq(asset.balanceOf(address(treasury)), treasury.reservedToken(address(asset)), "harvest left a surplus");
+        assertGe(asset.balanceOf(Protocol.DEAD), deadBefore + fees, "harvest burned less than it withdrew");
     }
 
     function keeperWithdraw(uint96 raw) external {
@@ -269,10 +308,8 @@ contract TreasuryHandler is Test {
         ghostKeeperPaid += Protocol.KEEPER.balance - before;
     }
 
-    function claimBounty(uint8 seed) external {
-        if (recordedEpochs.length == 0) return;
-        uint256 e = recordedEpochs[bound(seed, 0, recordedEpochs.length - 1)];
-        treasury.claimBounty(e);
+    function payRouterTeam() external {
+        hook.feeRouter().payTeam();
     }
 
     // ---- market ----
@@ -330,7 +367,9 @@ contract TreasuryInvariantTest is Fixture {
         vm.prank(carol);
         token.approve(address(treasury), type(uint256).max);
         vm.warp(OPEN + 1 days);
-        handler = new TreasuryHandler(treasury, hook, token, actor, intake, launchFactory, key, [alice, bob, carol]);
+        handler = new TreasuryHandler(
+            treasury, hook, token, actor, intake, launchFactory, projectFactory, key, [alice, bob, carol]
+        );
         bytes4[] memory selectors = new bytes4[](19);
         selectors[0] = handler.propose.selector;
         selectors[1] = handler.vote.selector;
@@ -347,7 +386,7 @@ contract TreasuryInvariantTest is Fixture {
         selectors[12] = handler.burnUnclaimed.selector;
         selectors[13] = handler.harvest.selector;
         selectors[14] = handler.keeperWithdraw.selector;
-        selectors[15] = handler.claimBounty.selector;
+        selectors[15] = handler.payRouterTeam.selector;
         selectors[16] = handler.trade.selector;
         selectors[17] = handler.buyback.selector;
         selectors[18] = handler.redeemHookFees.selector;
@@ -419,6 +458,21 @@ contract TreasuryInvariantTest is Fixture {
             assertGt(until, 0);
             (uint8 status,,,,,,) = treasury.epochResult(e);
             assertEq(status, 2);
+        }
+    }
+
+    /// @dev A recorded launch is keyed by its factory and number, and that pair maps back to the share's token.
+    function invariant_recordedLaunchesAreKeyedByFactory() public view {
+        uint256 n = handler.recordedCount();
+        for (uint256 i; i < n; ++i) {
+            uint256 e = handler.recordedEpochs(i);
+            (address f, uint64 number) = treasury.launchOf(e);
+            assertEq(f, handler.factoryOf(e));
+            (,,,, uint64 reported,,) = treasury.epochResult(e);
+            assertEq(number, reported);
+            assertEq(treasury.launchToken(f, number), handler.assetOf(e));
+            address other = f == Protocol.LAUNCH_FACTORY ? Protocol.PROJECT_FACTORY : Protocol.LAUNCH_FACTORY;
+            assertEq(treasury.launchToken(other, number), address(0), "the mirror position was recorded too");
         }
     }
 
