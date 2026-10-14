@@ -1,0 +1,24 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"
+remappings = ["v4-core/=lib/v4-core/", "forge-std/=lib/forge-std/src/", "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/", "solmate/=lib/solmate/"]
+
+[profile.default.fuzz]
+runs = 256
+seed = "0x9576d1f8e559c1f8dbb8495b19837fb0ea37ec16dafe0453484bd115f873c4da"
+
+[fmt]
+line_length = 120
+
+[profile.default.invariant]
+runs = 128
+depth = 64
+fail_on_revert = true
