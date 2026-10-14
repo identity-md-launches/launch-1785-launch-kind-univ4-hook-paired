@@ -37,14 +37,27 @@ contract PoolActor {
 
     function modify(PoolKey memory k, int24 lower, int24 upper, int256 liquidity) external returns (BalanceDelta) {
         return abi.decode(
-            manager.unlock(abi.encode(uint8(0), k, abi.encode(ModifyLiquidityParams(lower, upper, liquidity, 0)))),
+            manager.unlock(
+                abi.encode(uint8(0), k, abi.encode(ModifyLiquidityParams(lower, upper, liquidity, 0)), bytes(""))
+            ),
             (BalanceDelta)
         );
     }
 
     function swap(PoolKey memory k, bool zeroForOne, int256 amount, uint160 limit) external returns (BalanceDelta) {
         return abi.decode(
-            manager.unlock(abi.encode(uint8(1), k, abi.encode(SwapParams(zeroForOne, amount, limit)))), (BalanceDelta)
+            manager.unlock(abi.encode(uint8(1), k, abi.encode(SwapParams(zeroForOne, amount, limit)), bytes(""))),
+            (BalanceDelta)
+        );
+    }
+
+    function swapWithData(PoolKey memory k, bool zeroForOne, int256 amount, uint160 limit, bytes memory hookData)
+        external
+        returns (BalanceDelta)
+    {
+        return abi.decode(
+            manager.unlock(abi.encode(uint8(1), k, abi.encode(SwapParams(zeroForOne, amount, limit)), hookData)),
+            (BalanceDelta)
         );
     }
 
@@ -52,8 +65,12 @@ contract PoolActor {
         require(msg.sender == address(manager));
         (uint8 action, PoolKey memory k, bytes memory args) = abi.decode(data, (uint8, PoolKey, bytes));
         BalanceDelta d;
-        if (action == 0) (d,) = manager.modifyLiquidity(k, abi.decode(args, (ModifyLiquidityParams)), "");
-        else d = manager.swap(k, abi.decode(args, (SwapParams)), "");
+        if (action == 0) {
+            (d,) = manager.modifyLiquidity(k, abi.decode(args, (ModifyLiquidityParams)), "");
+        } else {
+            (,,, bytes memory hookData) = abi.decode(data, (uint8, PoolKey, bytes, bytes));
+            d = manager.swap(k, abi.decode(args, (SwapParams)), hookData);
+        }
         _settle(k.currency0, d.amount0());
         _settle(k.currency1, d.amount1());
         return abi.encode(d);
@@ -92,6 +109,11 @@ contract MockFactory {
 
     function register(uint64 n, PoolKey memory key, address requester) external {
         positions[n] = Position(key, -60, 60, requester);
+    }
+
+    function setRange(uint64 n, int24 lower, int24 upper) external {
+        positions[n].lower = lower;
+        positions[n].upper = upper;
     }
 
     function positionOf(uint64 n) external view returns (PoolKey memory, int24, int24, address) {
