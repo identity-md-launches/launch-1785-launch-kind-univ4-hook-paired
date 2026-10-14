@@ -188,9 +188,13 @@ contract MediciHook is ReentrancyGuard {
                 tstore(qslot, 0)
             }
             if (quoted != ethBase) revert InvalidQuote();
-            // Specified-side integer budgets may round the fee up by one wei.
+            // Specified-side integer budgets may round the fee up by at most two wei: with
+            // S * 10_000 = T * (10_000 + rate) + m and m < 10_000 + rate, the budgeted fee
+            // (T * rate + m) / 10_000 exceeds floor(T * rate / 10_000) by two whenever
+            // m > 10_000, which happens at launch rates above 200 bps. Exact-out sells
+            // (m < 10_000 - rate) round up by at most one.
             uint256 exact = ethBase * rate / 10_000;
-            if (fee < exact || fee > exact + 1) revert InvalidQuote();
+            if (fee < exact || fee > exact + 2) revert InvalidQuote();
         } else {
             fee = ethBase * rate / 10_000;
         }
@@ -297,7 +301,10 @@ contract MediciHook is ReentrancyGuard {
     }
 
     function price() external view returns (uint256) {
+        if (openedAt == 0) revert NotOpen();
         uint64 end = uint64(block.timestamp);
+        // No time has elapsed in the opening second: the average since open is the spot.
+        if (end == openedAt) return observations[observations.length - 1].spot;
         uint64 start = end > uint256(openedAt) + 1 days ? end - 1 days : openedAt;
         return twap(start, end);
     }

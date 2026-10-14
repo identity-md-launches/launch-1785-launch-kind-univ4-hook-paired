@@ -89,7 +89,8 @@ contract HookTest is Fixture {
         }
         fee = treasuryFee + teamFee;
         uint256 rate = buy ? hook.buyFeeBps() : 200;
-        assertApproxEqAbs(fee, base * rate / 10_000, 1);
+        assertGe(fee, base * rate / 10_000);
+        assertLe(fee, base * rate / 10_000 + (buy && exactIn ? 2 : 1));
         assertEq(teamFee, base * 50 / 10_000);
         assertEq(hook.teamOwed() - oldTeam, teamFee);
         assertEq(address(treasury).balance - oldTreasury, treasuryFee);
@@ -107,6 +108,35 @@ contract HookTest is Fixture {
         assertEq(d.amount1(), -int128(10_000 ether));
         (d,,) = _trade(false, false, 0.001 ether, TickMath.MAX_SQRT_PRICE - 1);
         assertEq(d.amount0(), int128(0.001 ether));
+    }
+
+    /// Exact-in buys at launch rates can budget a fee two wei above floor(base * rate / 10_000).
+    function test_exactInBuysSettleAcrossTheDecayWindow() public {
+        vm.warp(OPEN + 60);
+        assertEq(hook.buyFeeBps(), 4680);
+        uint256 amount = 0.01 ether;
+        uint256 target = amount * 10_000 / (10_000 + 4680);
+        assertEq(amount - target, target * 4680 / 10_000 + 2);
+        (BalanceDelta d, uint256 base, uint256 fee) = _trade(true, true, amount, TickMath.MIN_SQRT_PRICE + 1);
+        assertEq(d.amount0(), -int128(int256(amount)));
+        assertEq(base, target);
+        assertEq(fee, amount - target);
+        for (uint256 i; i < 40; ++i) {
+            vm.warp(OPEN + 61 + i * 20);
+            _trade(true, true, 10000000000000002 + i * 1e15, TickMath.MIN_SQRT_PRICE + 1);
+        }
+    }
+
+    function test_priceAtOpeningSecondIsTheOpeningSpot() public {
+        assertEq(block.timestamp, OPEN);
+        assertEq(hook.price(), 1e10);
+        assertEq(treasury.price(), 1e10);
+        assertEq(treasury.proposeCost(), 200_000 ether);
+        actor.swap(key, true, -int256(0.5 ether), TickMath.MIN_SQRT_PRICE + 1);
+        (, uint192 spot,) = hook.observations(0);
+        assertEq(hook.price(), spot);
+        vm.expectRevert(MediciHook.NotOpen.selector);
+        hook.twap(OPEN, OPEN);
     }
 
     function test_launchFeeSurplusAndTeamClaim() public {

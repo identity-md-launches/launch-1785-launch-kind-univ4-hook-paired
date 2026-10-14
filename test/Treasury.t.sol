@@ -35,7 +35,7 @@ contract RefusingProposer {
 
     receive() external payable {
         require(!reject, "no ETH");
-        if (reenter) (reentrySucceeded,) = address(treasury).call(abi.encodeCall(treasury.claimBounty, (1)));
+        if (reenter) (reentrySucceeded,) = address(treasury).call(abi.encodeCall(treasury.claimBacker, (1)));
     }
 }
 
@@ -448,26 +448,145 @@ contract TreasuryTest is Fixture {
         treasury.harvest(77);
     }
 
-    function test_failedBountyRemainsEscrowedAndCanRetryNoReentry() public {
-        RefusingProposer proposer = new RefusingProposer(token, treasury);
+    function _contractProposerWins() internal returns (RefusingProposer proposer, uint256 bounty) {
+        proposer = new RefusingProposer(token, treasury);
         token.transfer(address(proposer), 5_000_000 ether);
         proposer.proposeAndVote(bytes("{\"idea\":\"one\"}"));
         _donate(1 ether);
         vm.warp(treasury.epochEnd(1));
         treasury.settle(1);
-        _commission();
-        MockToken asset = new MockToken();
-        _record(79, asset, false);
-        (,,, uint256 bounty,,,) = treasury.epochResult(1);
+        (,,, bounty,,,) = treasury.epochResult(1);
         assertGt(bounty, 0);
         assertEq(treasury.escrowed(), bounty);
+        _commission();
+    }
+
+    function test_failedBountyIsKeptByTreasuryAsFreeETH() public {
+        (RefusingProposer proposer, uint256 bounty) = _contractProposerWins();
+        uint256 freeBefore = treasury.freeETH();
+        MockToken asset = new MockToken();
+        _eligiblePosition(launchFactory, 79, asset);
+        vm.prank(Protocol.KEEPER);
+        vm.expectEmit(true, true, true, true, address(treasury));
+        emit MediciTreasury.BountyPaid(1, address(proposer), bounty, false);
+        treasury.recordCommission(1, 79, "job-1");
+        (uint8 status,,, uint256 unpaid,,,) = treasury.epochResult(1);
+        assertEq(status, 2);
+        assertEq(unpaid, 0);
+        assertEq(address(proposer).balance, 0);
+        assertEq(treasury.escrowed(), 0);
+        assertEq(treasury.freeETH(), freeBefore + bounty);
+        assertEq(treasury.claimable(1, address(proposer)), 50 ether);
+    }
+
+    function test_bountyPayoutCannotReenter() public {
+        (RefusingProposer proposer, uint256 bounty) = _contractProposerWins();
         proposer.acceptAndReenter();
-        treasury.claimBounty(1);
+        MockToken asset = new MockToken();
+        _record(79, asset, false);
         assertEq(address(proposer).balance, bounty);
         assertEq(treasury.escrowed(), 0);
         assertFalse(proposer.reentrySucceeded());
-        treasury.claimBounty(1);
-        assertEq(address(proposer).balance, bounty);
+        assertEq(treasury.claimable(1, address(proposer)), 50 ether);
+    }
+
+    function _eligiblePosition(MockFactory f, uint64 n, MockToken asset) internal {
+        PoolKey memory k =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(asset)), 12_500, 60, IHooks(address(0)));
+        f.register(n, k, address(treasury));
+        asset.mint(address(this), 950 ether);
+        asset.mint(address(treasury), 50 ether);
+    }
+
+    function _winEpoch(uint256 e, bytes memory brief) internal {
+        _proposal(alice, brief);
+        _vote(alice, e, 1, 3_000_000 ether);
+        _donate(1 ether);
+        vm.warp(treasury.epochEnd(e));
+        treasury.settle(e);
+        imd.mint(address(treasury), 0.5 ether);
+        vm.prank(Protocol.KEEPER);
+        treasury.commission(e, brief);
+    }
+
+    function test_sameLaunchNumberOnEachFactoryIsRecordedAndHarvestedSeparately() public {
+        _winEpoch(1, bytes("one"));
+        MockToken assetA = new MockToken();
+        _eligiblePosition(launchFactory, 77, assetA);
+        vm.prank(Protocol.KEEPER);
+        vm.expectEmit(true, true, true, true, address(treasury));
+        emit MediciTreasury.Recorded(1, Protocol.LAUNCH_FACTORY, 77, "job-1");
+        treasury.recordCommission(1, 77, "job-1");
+        (address factory, uint64 number) = treasury.launchOf(1);
+        assertEq(factory, Protocol.LAUNCH_FACTORY);
+        assertEq(number, 77);
+
+        vm.warp(treasury.epochEnd(1) + 1);
+        _winEpoch(2, bytes("two"));
+        MockToken assetB = new MockToken();
+        _eligiblePosition(projectFactory, 77, assetB);
+        vm.prank(Protocol.KEEPER);
+        treasury.recordCommission(2, 77, "job-2");
+        (uint8 status,,,, uint64 recorded,,) = treasury.epochResult(2);
+        assertEq(status, 2);
+        assertEq(recorded, 77);
+        (factory,) = treasury.launchOf(2);
+        assertEq(factory, Protocol.PROJECT_FACTORY);
+        assertEq(treasury.launchToken(Protocol.LAUNCH_FACTORY, 77), address(assetA));
+        assertEq(treasury.launchToken(Protocol.PROJECT_FACTORY, 77), address(assetB));
+        (address shareToken,,,) = treasury.backerShare(2);
+        assertEq(shareToken, address(assetB));
+        assertEq(treasury.claimable(2, alice), 50 ether);
+
+        // Both positions are harvested by the one number; each burns only its own surplus.
+        assetA.mint(address(launchFactory), 3 ether);
+        launchFactory.seed(77, 0, 3 ether);
+        assetB.mint(address(projectFactory), 4 ether);
+        projectFactory.seed(77, 0, 4 ether);
+        treasury.harvest(77);
+        assertEq(assetA.balanceOf(Protocol.DEAD), 3 ether);
+        assertEq(assetB.balanceOf(Protocol.DEAD), 4 ether);
+        assertEq(assetA.balanceOf(address(treasury)), 50 ether);
+        assertEq(assetB.balanceOf(address(treasury)), 50 ether);
+
+        // A recorded number cannot be recorded again on the same factory.
+        vm.warp(treasury.epochEnd(2) + 1);
+        _winEpoch(3, bytes("three"));
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommission(3, 77, "job-3");
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(3, Protocol.PROJECT_FACTORY, 77, "job-3");
+    }
+
+    function test_ambiguousNumberNeedsExplicitFactory() public {
+        _winEpoch(1, bytes("one"));
+        MockToken assetA = new MockToken();
+        MockToken assetB = new MockToken();
+        _eligiblePosition(launchFactory, 5, assetA);
+        _eligiblePosition(projectFactory, 5, assetB);
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.AmbiguousLaunch.selector);
+        treasury.recordCommission(1, 5, "job");
+        vm.expectRevert(MediciTreasury.Unauthorized.selector);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 5, "job");
+        vm.prank(Protocol.KEEPER);
+        vm.expectRevert(MediciTreasury.InvalidInput.selector);
+        treasury.recordCommissionAt(1, alice, 5, "job");
+        vm.prank(Protocol.KEEPER);
+        treasury.recordCommissionAt(1, Protocol.PROJECT_FACTORY, 5, "job");
+        (address factory,) = treasury.launchOf(1);
+        assertEq(factory, Protocol.PROJECT_FACTORY);
+        (address shareToken,,,) = treasury.backerShare(1);
+        assertEq(shareToken, address(assetB));
+        // Once one is recorded the other is no longer ambiguous.
+        vm.warp(treasury.epochEnd(1) + 1);
+        _winEpoch(2, bytes("two"));
+        vm.prank(Protocol.KEEPER);
+        treasury.recordCommission(2, 5, "job-2");
+        (factory,) = treasury.launchOf(2);
+        assertEq(factory, Protocol.LAUNCH_FACTORY);
     }
 
     function test_keeperBudgetFreeETHAndEpochReset() public {

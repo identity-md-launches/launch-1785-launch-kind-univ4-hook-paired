@@ -16,6 +16,8 @@ contract MediciFeeRouter is ReentrancyGuard {
     bool public bound;
     event LaunchNumberSet(uint64 indexed launchNumber);
     event Harvested(uint64 indexed launchNumber, uint256 eth, uint256 burned);
+    event TeamPaid(address indexed team, uint256 amount);
+    event TeamPaymentDeferred(address indexed team, uint256 amount);
     error InvalidLaunch();
     error TransferFailed();
 
@@ -48,12 +50,28 @@ contract MediciFeeRouter is ReentrancyGuard {
             IERC20(token).safeTransfer(address(treasury), amount);
             treasury.burnDeposited();
         }
-        uint256 eth = address(this).balance;
-        if (eth != 0) {
-            (bool ok,) = treasury.team().call{value: eth}("");
-            if (!ok) revert TransferFailed();
-        }
+        // A TEAM that rejects ETH must not undo the burn: the ETH waits here for payTeam().
+        uint256 eth = _payTeam(false);
         emit Harvested(launchNumber, eth, amount);
+    }
+
+    /// @notice Sends every ETH held here to the current TEAM. Anyone may call it.
+    function payTeam() external nonReentrant {
+        _payTeam(true);
+    }
+
+    function _payTeam(bool strict) internal returns (uint256 eth) {
+        eth = address(this).balance;
+        if (eth == 0) return 0;
+        address recipient = treasury.team();
+        (bool ok,) = recipient.call{value: eth}("");
+        if (ok) {
+            emit TeamPaid(recipient, eth);
+            return eth;
+        }
+        if (strict) revert TransferFailed();
+        emit TeamPaymentDeferred(recipient, eth);
+        return 0;
     }
     receive() external payable {}
 }

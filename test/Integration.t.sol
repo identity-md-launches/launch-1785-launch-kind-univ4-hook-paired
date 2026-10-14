@@ -164,6 +164,29 @@ contract IntegrationTest is Fixture {
         assertGt(hook.teamOwed(), owed);
     }
 
+    function test_rejectingTeamDoesNotBlockRouterBurn() public {
+        RejectETH receiver = new RejectETH();
+        vm.prank(Protocol.TEAM);
+        treasury.setTeam(address(receiver));
+        launchFactory.register(46, key, address(router));
+        router.setLaunchNumber(46);
+        vm.deal(address(launchFactory), 1 ether);
+        token.transfer(address(launchFactory), 1_000 ether);
+        launchFactory.seed(46, 0.1 ether, 1_000 ether);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit MediciFeeRouter.TeamPaymentDeferred(address(receiver), 0.1 ether);
+        router.harvest();
+        assertEq(treasury.totalBurned(), 1_000 ether);
+        assertEq(address(router).balance, 0.1 ether);
+        vm.expectRevert(MediciFeeRouter.TransferFailed.selector);
+        router.payTeam();
+        vm.prank(address(receiver));
+        treasury.setTeam(bob);
+        router.payTeam();
+        assertEq(bob.balance, 0.1 ether);
+        assertEq(address(router).balance, 0);
+    }
+
     function test_factoryHarvestKeepsIMDAndOnlyBurnsSurplusLaunchTokens() public {
         _twoWinners();
         _commission();

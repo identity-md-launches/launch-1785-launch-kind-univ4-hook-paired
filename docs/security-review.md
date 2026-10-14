@@ -19,19 +19,20 @@ This is the implementation review performed with the delivered work. It is not a
 | Commission authentication | Exact winning hash, keeper/public time gate, one attempt per candidate, exact/reset IMD approval, hard input cap and exact-output check. |
 | Callbacks | Fixed Intake and live request checks, replay rejection, bounded URI, no external calls on result/failure. Both success and promotion execute under 200,000 gas in tests. |
 | Asynchronous failure | Callback loss handled by permissionless lapse; promotion invalidates stale request IDs, recomputes quorum/bounty from runner votes and restarts deadlines. |
-| Bounty payout | State changed before call; failed transfer restores escrow; retry destination fixed. Rejecting and reentering proposer tested. |
-| Backer reserve | Factory requester proof, supply threshold on unreserved holdings, unique launch recording, per-token reserve aggregation, one claim per voter, 90-day expiry and dust burn. |
+| Bounty payout | State changed before call; a rejected transfer is kept by the treasury as free ETH with no retry, so a proposer that cannot receive ETH cannot lock escrow. Rejecting and reentering proposers tested. |
+| Backer reserve | Factory requester proof, supply threshold on unreserved holdings, launch recording unique per (factory, number) with an explicit-factory path for the ambiguous case, per-token reserve aggregation, one claim per voter, 90-day expiry and dust burn. |
+| Fee router | A TEAM that rejects ETH defers the payment inside the router instead of reverting the MEDICI burn; `payTeam()` retries. |
 | Reentrancy | OZ guard on externally interacting treasury/router entry points and hook fee claims; callback authorization and CEI on payout accounting. No user-provided arbitrary calls or delegatecalls. |
 | Role powers | No shared administrator. TEAM and KEEPER can hand over only their own roles. Rejected TEAM claims do not prevent swaps. |
 | Offline reproducibility | Pinned compiler/settings and vendored source/licenses; bundle tool checks import resolution and source-size limit. |
 
 ## Interpretation and bounded choices
 
-- The fee base is the native pool delta, before adding/subtracting the hook fee; specified-side budgeting permits at most one wei rounding up. All launch-rate excess belongs to the treasury.
+- The fee base is the native pool delta, before adding/subtracting the hook fee; specified-side budgeting permits at most two wei rounding up on exact-in buys (only reachable at launch rates) and one on exact-out sells, and `afterSwap` enforces exactly those bounds. All launch-rate excess belongs to the treasury.
 - Weeks use a fixed calendar from pool open. A preceding extension shortens the next active epoch, not its original proposal deadline. The epoch TWAP covers its actual active start through its final end.
 - IDs start at one; zero indicates no winner or no live request. A separate router `bound` bit makes one-time binding independent of numeric sentinels.
 - Price is arithmetic ETH per MEDICI with 18-decimal scaling. Historical observations are never pruned; queries are logarithmic. There is no observation-cardinality exhaustion or dependency on a keeper maintaining the oracle.
-- Bounty is unpaid escrow in the public result. The extra permissionless `claimBounty` retries a rejected transfer. Promotion consumes the runner once; no third-place promotion exists.
+- Bounty is unpaid escrow in the public result until the launch is recorded; a rejected transfer is kept, as the brief specifies. Promotion consumes the runner once; no third-place promotion exists.
 - Buyback tip is ETH within the unlocked budget; min output allows a fixed 5% deviation, including LP fee. No caller can loosen that bound. The IMD acquisition uses its independent 0.03 ETH absolute ceiling.
 - Flags are advisory. The keeper must assess launch/job semantic correctness before recording it. JSON validity and actual production of the requested launch are Intake/keeper responsibilities, not an on-chain parser or external price oracle.
 

@@ -51,6 +51,7 @@ contract MediciTreasury is ReentrancyGuard {
         uint64 winnerSetAt;
         uint64 deadline;
         uint64 launchNumber;
+        address launchFactory;
         uint256 winner;
         uint256 runner;
         uint256 bounty;
@@ -83,8 +84,9 @@ contract MediciTreasury is ReentrancyGuard {
     mapping(uint256 => Share) private shares;
     mapping(address => uint256) public reservedToken;
     mapping(bytes32 => uint256) private requestEpoch;
-    mapping(uint64 => address) public launchFactory;
-    mapping(uint64 => address) public launchToken;
+    /// @dev Recorded launch token by factory and position number. The two factories number
+    /// their positions independently, so the number alone does not identify a launch.
+    mapping(address => mapping(uint64 => address)) public launchToken;
     mapping(uint256 => uint256) public income;
     mapping(uint256 => uint256) public keeperSpent;
     mapping(uint256 => uint64) public extension;
@@ -98,6 +100,7 @@ contract MediciTreasury is ReentrancyGuard {
     error Slippage();
     error UnknownRequest();
     error TransferFailed();
+    error AmbiguousLaunch();
     event Proposed(uint256 indexed epoch, uint256 indexed id, address indexed proposer, string title, bytes brief);
     event Voted(uint256 indexed epoch, uint256 indexed id, address indexed voter, uint256 amount);
     event Extended(uint256 indexed epoch, uint64 end);
@@ -109,13 +112,13 @@ contract MediciTreasury is ReentrancyGuard {
     event Promoted(uint256 indexed epoch, uint8 status, uint256 winner, uint256 bounty);
     event Lapsed(uint256 indexed epoch);
     event Skipped(uint256 indexed epoch, string reason);
-    event Recorded(uint256 indexed epoch, uint64 indexed launchNumber, string jobId);
+    event Recorded(uint256 indexed epoch, address indexed factory, uint64 indexed launchNumber, string jobId);
     event BountyPaid(uint256 indexed epoch, address indexed proposer, uint256 amount, bool success);
     event BackerClaimed(uint256 indexed epoch, address indexed voter, uint256 amount);
     event UnclaimedBurned(uint256 indexed epoch, uint256 amount);
     event Buyback(address indexed caller, uint256 ethSpent, uint256 tip, uint256 burned);
     event KeeperWithdrawn(uint256 indexed epoch, uint256 amount);
-    event Harvested(uint64 indexed launchNumber, uint256 burned);
+    event Harvested(address indexed factory, uint64 indexed launchNumber, uint256 burned);
     event TeamChanged(address indexed previous, address indexed next);
     event KeeperChanged(address indexed previous, address indexed next);
     event Burned(uint256 amount);
@@ -274,6 +277,12 @@ contract MediciTreasury is ReentrancyGuard {
     {
         Epoch storage x = epochs[e];
         return (x.status, x.winner, x.runner, x.bounty, x.launchNumber, x.deadline, x.jobId);
+    }
+
+    /// @notice The factory and position number recorded for an epoch; zero until recorded.
+    function launchOf(uint256 e) external view returns (address factory, uint64 launchNumber) {
+        Epoch storage x = epochs[e];
+        return (x.launchFactory, x.launchNumber);
     }
 
     function requestOf(uint256 e) external view returns (bytes32 requestId, uint64 openToAllAt) {
@@ -437,10 +446,19 @@ contract MediciTreasury is ReentrancyGuard {
         emit Skipped(e, reason);
     }
 
-    function _findLaunch(uint64 n) internal view returns (address factory, address asset) {
-        (factory, asset) = _probeLaunch(Protocol.LAUNCH_FACTORY, n);
-        if (factory == address(0)) (factory, asset) = _probeLaunch(Protocol.PROJECT_FACTORY, n);
-        if (factory == address(0)) revert InvalidInput();
+    /// @dev A position is eligible when it is not yet recorded, names this treasury as its
+    /// requester, pairs a launch token with ETH or IMD, and at least 5% of that token's supply
+    /// is held here beyond every existing reserve. Returns the zero asset otherwise.
+    function _eligible(address f, uint64 n) internal view returns (address asset, uint256 available) {
+        if (launchToken[f][n] != address(0)) return (address(0), 0);
+        (address factory, address candidate) = _probeLaunch(f, n);
+        if (factory == address(0) || candidate == token) return (address(0), 0);
+        uint256 balance = IERC20(candidate).balanceOf(address(this));
+        uint256 reserved = reservedToken[candidate];
+        available = balance > reserved ? balance - reserved : 0;
+        uint256 supply = IERC20(candidate).totalSupply();
+        if (supply == 0 || available < (supply + 19) / 20) return (address(0), 0);
+        asset = candidate;
     }
 
     function _probeLaunch(address f, uint64 n) internal view returns (address, address) {
@@ -454,30 +472,53 @@ contract MediciTreasury is ReentrancyGuard {
         return (address(0), address(0));
     }
 
+    /// @notice Records the commissioned launch numbered `n` on whichever factory holds an
+    /// eligible, unrecorded position of that number. Reverts AmbiguousLaunch when both do;
+    /// `recordCommissionAt` then names the factory.
     function recordCommission(uint256 e, uint64 n, string calldata jobId) external onlyKeeper nonReentrant {
+        _recordable(e, jobId);
+        (address assetA, uint256 availableA) = _eligible(Protocol.LAUNCH_FACTORY, n);
+        (address assetB, uint256 availableB) = _eligible(Protocol.PROJECT_FACTORY, n);
+        if (assetA != address(0) && assetB != address(0)) revert AmbiguousLaunch();
+        if (assetA != address(0)) _record(e, Protocol.LAUNCH_FACTORY, n, assetA, availableA, jobId);
+        else if (assetB != address(0)) _record(e, Protocol.PROJECT_FACTORY, n, assetB, availableB, jobId);
+        else revert InvalidInput();
+    }
+
+    /// @notice Same as `recordCommission` with the factory named explicitly.
+    function recordCommissionAt(uint256 e, address factory, uint64 n, string calldata jobId)
+        external
+        onlyKeeper
+        nonReentrant
+    {
+        if (factory != Protocol.LAUNCH_FACTORY && factory != Protocol.PROJECT_FACTORY) revert InvalidInput();
+        _recordable(e, jobId);
+        (address asset, uint256 available) = _eligible(factory, n);
+        if (asset == address(0)) revert InvalidInput();
+        _record(e, factory, n, asset, available, jobId);
+    }
+
+    function _recordable(uint256 e, string calldata jobId) internal view {
         Epoch storage x = epochs[e];
-        if (x.status != 1 || !x.commissioned || launchFactory[n] != address(0) || block.timestamp >= x.deadline) {
-            revert WrongState();
-        }
+        if (x.status != 1 || !x.commissioned || block.timestamp >= x.deadline) revert WrongState();
         if (bytes(jobId).length == 0) revert InvalidInput();
-        (address f, address asset) = _findLaunch(n);
-        if (asset == token) revert InvalidInput();
-        uint256 balance = IERC20(asset).balanceOf(address(this));
-        uint256 available = balance - reservedToken[asset];
-        uint256 supply = IERC20(asset).totalSupply();
-        if (supply == 0 || available < (supply + 19) / 20) revert InvalidInput();
-        launchFactory[n] = f;
-        launchToken[n] = asset;
+    }
+
+    function _record(uint256 e, address f, uint64 n, address asset, uint256 available, string calldata jobId) internal {
+        Epoch storage x = epochs[e];
+        launchToken[f][n] = asset;
         x.status = 2;
+        x.launchFactory = f;
         x.launchNumber = n;
         x.jobId = jobId;
         _clearRequest(x);
         shares[e] = Share(asset, uint64(block.timestamp + 90 days), false, available, 0);
         reservedToken[asset] += available;
         _payBounty(e);
-        emit Recorded(e, n, jobId);
+        emit Recorded(e, f, n, jobId);
     }
 
+    /// @dev The bounty is paid once. If the proposer rejects it, the treasury keeps it as free ETH.
     function _payBounty(uint256 e) internal {
         Epoch storage x = epochs[e];
         uint256 amount = x.bounty;
@@ -486,16 +527,7 @@ contract MediciTreasury is ReentrancyGuard {
         escrowed -= amount;
         address proposer = proposals[e][x.winner].proposer;
         (bool ok,) = proposer.call{value: amount}("");
-        if (!ok) {
-            x.bounty = amount;
-            escrowed += amount;
-        }
         emit BountyPaid(e, proposer, amount, ok);
-    }
-
-    function claimBounty(uint256 e) external nonReentrant {
-        if (epochs[e].status != 2) revert WrongState();
-        _payBounty(e);
     }
 
     function claimable(uint256 e, address voter) public view returns (uint256) {
@@ -619,19 +651,26 @@ contract MediciTreasury is ReentrancyGuard {
         emit KeeperWithdrawn(e, amount);
     }
 
+    /// @notice Harvests every recorded launch numbered `n`, on either factory.
     function harvest(uint64 n) external nonReentrant {
-        address f = launchFactory[n];
-        if (f == address(0)) revert InvalidInput();
+        bool any = _harvest(Protocol.LAUNCH_FACTORY, n);
+        any = _harvest(Protocol.PROJECT_FACTORY, n) || any;
+        if (!any) revert InvalidInput();
+    }
+
+    function _harvest(address f, uint64 n) internal returns (bool) {
+        address asset = launchToken[f][n];
+        if (asset == address(0)) return false;
         ILaunchFactory factory = ILaunchFactory(f);
         (PoolKey memory key,,, address requester) = factory.positionOf(n);
         if (requester != address(this)) revert WrongState();
         factory.claimFees(n);
         factory.withdraw(address(this), key.currency0);
         factory.withdraw(address(this), key.currency1);
-        address asset = launchToken[n];
         uint256 amount = IERC20(asset).balanceOf(address(this)) - reservedToken[asset];
         if (amount != 0) IERC20(asset).safeTransfer(Protocol.DEAD, amount);
-        emit Harvested(n, amount);
+        emit Harvested(f, n, amount);
+        return true;
     }
 
     function burnDeposited() external nonReentrant returns (uint256 amount) {
